@@ -1,3 +1,0 @@
-# Assignment 2 — Task 1: Origem incremental e watermark
-pymysql
-boto3

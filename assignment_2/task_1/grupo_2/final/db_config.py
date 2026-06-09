@@ -1,19 +1,32 @@
 """
 Helper de conexão com o RDS MySQL (classicmodels).
 
-Hierarquia de credenciais:
-  1. AWS Secrets Manager (se SECRET_ARN estiver definido)
-  2. Variáveis de ambiente (RDS_HOST, RDS_PORT, etc.)
-  3. Arquivo rds_connection.env do A1 (fallback para dev local)
+Hierarquia de credenciais (em ordem de prioridade):
+  1. AWS Secrets Manager  — se SECRET_ARN estiver definido
+  2. Variáveis de ambiente — DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+  3. Arquivo .env local    — lido automaticamente se existir
+
+Uso:
+    from db_config import get_connection
+
+    conn = get_connection()            # transação manual (autocommit=False)
+    conn = get_connection(autocommit=True)  # cada statement é commitado
+
+    # Ou via context manager:
+    with connect() as conn:
+        cur = conn.cursor()
+        ...
 """
 
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
-# ── Leitura do .env (fallback) ────────────────────────────────────────────────
+# ── Leitura do .env (fallback local) ──────────────────────────────────────────
 
 _ENV_CANDIDATES = [
+    Path(__file__).resolve().parent / ".env",
     Path(__file__).resolve().parents[3] / "assignment_1" / "task_1" / "rds_connection.env",
     Path(__file__).resolve().parents[4] / "assignment_1" / "task_1" / "rds_connection.env",
 ]
@@ -72,7 +85,7 @@ def get_config() -> dict:
 
     Prioridade:
       1. Secrets Manager (se SECRET_ARN definido)
-      2. Variáveis de ambiente / rds_connection.env
+      2. Variáveis de ambiente / .env
     """
     secret = _get_secret_from_aws()
 
@@ -87,11 +100,11 @@ def get_config() -> dict:
         }
 
     return {
-        "host":     _get("RDS_HOST"),
-        "port":     int(_get("RDS_PORT", "3306")),
-        "db":       _get("RDS_DB", "classicmodels"),
-        "user":     _get("RDS_USER", "admin"),
-        "password": _get("RDS_PASSWORD"),
+        "host":     _get("DB_HOST", _get("RDS_HOST")),
+        "port":     int(_get("DB_PORT", _get("RDS_PORT", "3306"))),
+        "db":       _get("DB_NAME", _get("RDS_DB", "classicmodels")),
+        "user":     _get("DB_USER", _get("RDS_USER", "admin")),
+        "password": _get("DB_PASSWORD", _get("RDS_PASSWORD")),
         "source":   "env",
     }
 
@@ -110,8 +123,10 @@ def get_connection(autocommit: bool = False):
 
     if not cfg["host"]:
         raise RuntimeError(
-            "RDS_HOST não definido. Configure SECRET_ARN para usar Secrets Manager, "
-            "ou defina RDS_HOST via variável de ambiente / rds_connection.env."
+            "Host do banco não definido. Configure:\n"
+            "  • SECRET_ARN (para Secrets Manager), ou\n"
+            "  • DB_HOST via variável de ambiente, ou\n"
+            "  • Arquivo .env na raiz do projeto."
         )
 
     return pymysql.connect(
@@ -124,3 +139,20 @@ def get_connection(autocommit: bool = False):
         connect_timeout=15,
         autocommit=autocommit,
     )
+
+
+@contextmanager
+def connect(autocommit: bool = False):
+    """
+    Context manager para conexão com o banco.
+
+    Uso:
+        with connect() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+    """
+    conn = get_connection(autocommit=autocommit)
+    try:
+        yield conn
+    finally:
+        conn.close()

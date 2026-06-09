@@ -9,6 +9,11 @@ Checks:
   4. Integridade: todo orderNumber em orders tem ao menos uma linha em orderdetails.
   5. Consistência: quantityOrdered > 0 e priceEach > 0 em todas as orderdetails.
 
+Fontes de design:
+  - 5 checks com logging detalhado: Matheus Carvalho
+  - information_schema para check de tabela: Alessandra Bello / Gustavo Tironi
+  - Contagem de pendentes e detalhamento: Matheus Carvalho
+
 Exit code: 0 = todas as checagens passaram, 1 = qualquer falha.
 """
 
@@ -52,7 +57,7 @@ def check_watermark_exists(cur) -> bool:
     """Verifica se etl_watermark existe e contém classicmodels_sales."""
     log.info("═══ Check 1: etl_watermark existe e contém o registro ═══")
 
-    # Verifica se a tabela existe
+    # Verifica se a tabela existe (via information_schema — Alessandra/Gustavo)
     cur.execute(
         "SELECT COUNT(*) FROM information_schema.tables "
         "WHERE table_schema = %s AND table_name = 'etl_watermark'",
@@ -191,7 +196,7 @@ def main() -> int:
         table_ok = check_watermark_exists(cur)
         if not table_ok:
             log.info("")
-            log.info("═" * 56)
+            log.info("═" * 60)
             log.error("RESULTADO: FALHOU — etl_watermark não está configurada.")
             return 1
 
@@ -219,7 +224,7 @@ def main() -> int:
 
     # Resultado final
     log.info("")
-    log.info("═" * 56)
+    log.info("═" * 60)
     total_checks = 5
     n_failures = len(failures)
     passed = total_checks - n_failures

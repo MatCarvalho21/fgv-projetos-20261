@@ -3,26 +3,25 @@
 Simula chegada de novos pedidos no banco classicmodels.
 
 Uso:
-    python simulate_new_orders.py [--count N] [--seed S] [--dry-run]
+    python scripts/simulate_new_orders.py [--count N] [--seed S] [--dry-run]
 
 Comportamento:
   - Escolhe customerNumber e productCode existentes no banco.
   - Insere em orders com orderDate estritamente posterior ao watermark atual
     (ou MAX(orders.orderDate), o que for maior).
   - Insere ao menos uma linha em orderdetails por pedido.
+  - priceEach entre buyPrice e MSRP (regra de negócio do star schema).
   - Garante quantityOrdered * priceEach > 0 (consistência com sales_amount do A1).
   - NÃO atualiza etl_watermark (responsabilidade do job Glue na Task 2).
   - Usa transações para garantir atomicidade (orders + orderdetails juntos).
   - orderNumber calculado como MAX(orderNumber) + incremento sequencial
     (o schema do classicmodels não usa AUTO_INCREMENT nessa coluna).
 
-Melhorias vs. referência (Gustavo):
-  - Diversidade de status: In Process (60%), Shipped (30%), On Hold (10%)
-  - shippedDate preenchido para pedidos Shipped
-  - --dry-run para preview sem inserções
-  - Concorrência segura via SELECT ... FOR UPDATE
-  - Validação interna de dados antes do INSERT
-  - Tabela formatada no resumo final
+Features consolidadas de:
+  - Matheus: dry-run, status variados, shippedDate, FOR UPDATE, tabela formatada
+  - Alessandra: priceEach entre buyPrice e MSRP
+  - Gustavo: baseline com dias úteis recentes
+  - Sillas: bootstrap de referências
 
 Exit code: 0 = sucesso, 1 = falha.
 """
@@ -40,7 +39,7 @@ import db_config
 
 PIPELINE_NAME = "classicmodels_sales"
 
-# Distribuição de status dos pedidos simulados
+# Distribuição de status dos pedidos simulados (Matheus)
 STATUS_WEIGHTS = [
     ("In Process", 60),
     ("Shipped", 30),
@@ -131,10 +130,10 @@ def get_customers(cur) -> list[int]:
     return [row[0] for row in cur.fetchall()]
 
 
-def get_products(cur) -> list[tuple[str, float]]:
-    """Retorna todos os (productCode, MSRP) existentes."""
-    cur.execute("SELECT productCode, MSRP FROM products")
-    return [(row[0], float(row[1])) for row in cur.fetchall()]
+def get_products(cur) -> list[tuple[str, float, float]]:
+    """Retorna todos os (productCode, buyPrice, MSRP) existentes."""
+    cur.execute("SELECT productCode, buyPrice, MSRP FROM products")
+    return [(row[0], float(row[1]), float(row[2])) for row in cur.fetchall()]
 
 
 def get_next_order_number(cur) -> int:
@@ -199,10 +198,10 @@ def build_order_payloads(
         chosen_products = rng.sample(products, num_lines)
 
         details = []
-        for line_num, (product_code, msrp) in enumerate(chosen_products, start=1):
-            quantity = rng.randint(1, 30)
-            # Preço entre 70% e 100% do MSRP — garante valor positivo
-            price_each = round(msrp * rng.uniform(0.70, 1.00), 2)
+        for line_num, (product_code, buy_price, msrp) in enumerate(chosen_products, start=1):
+            quantity = rng.randint(1, 50)
+            # Preço entre buyPrice e MSRP — regra de negócio do star schema (Alessandra)
+            price_each = round(rng.uniform(buy_price, msrp), 2)
             price_each = max(price_each, 0.01)  # failsafe
 
             details.append({
@@ -219,7 +218,7 @@ def build_order_payloads(
                 "requiredDate": required_date,
                 "shippedDate": shipped_date,
                 "status": status,
-                "comments": f"Pedido simulado A2/Task1 #{i + 1} (seed={rng.getstate()[1][0]})",
+                "comments": f"Pedido simulado A2/Task1 #{i + 1}",
                 "customerNumber": customer,
             },
             "details": details,
@@ -293,14 +292,17 @@ def print_summary(created: list[dict], dry_run: bool = False) -> None:
 
     # Cabeçalho
     log.info("")
-    log.info("=" * 72)
+    log.info("=" * 80)
     log.info("RESUMO — Pedidos %s", mode)
-    log.info("=" * 72)
+    log.info("=" * 80)
 
     # Tabela
-    header = f"  {'#':<4} {'orderNumber':<13} {'orderDate':<12} {'status':<13} {'customer':<10} {'details':<8} {'sales_amount':>13}"
+    header = (
+        f"  {'#':<4} {'orderNumber':<13} {'orderDate':<12} "
+        f"{'status':<13} {'customer':<10} {'details':<8} {'sales_amount':>13}"
+    )
     log.info(header)
-    log.info("  " + "-" * 70)
+    log.info("  " + "-" * 76)
 
     total_details = 0
     total_amount = 0.0
@@ -324,13 +326,13 @@ def print_summary(created: list[dict], dry_run: bool = False) -> None:
             sales,
         )
 
-    log.info("  " + "-" * 70)
+    log.info("  " + "-" * 76)
     log.info("  Pedidos: %d", len(created))
     log.info("  Faixa de datas: %s → %s", min(dates), max(dates))
     log.info("  Total linhas em orderdetails: %d", total_details)
     log.info("  Sales amount total: %.2f", total_amount)
     log.info("  IDs: %s", [o["order"]["orderNumber"] for o in created])
-    log.info("=" * 72)
+    log.info("=" * 80)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

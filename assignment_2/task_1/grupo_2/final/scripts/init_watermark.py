@@ -2,10 +2,16 @@
 """
 Inicializa a tabela etl_watermark no banco classicmodels.
 
-Idempotente:
-  - Cria a tabela se não existir.
-  - Insere o registro 'classicmodels_sales' se ausente.
-  - Inicializa last_processed_order_date com MAX(orders.orderDate) atual.
+Idempotente — pode ser executado múltiplas vezes com segurança:
+  1. Cria a tabela se não existir.
+  2. Insere o registro 'classicmodels_sales' se ausente.
+  3. Inicializa last_processed_order_date com MAX(orders.orderDate) atual.
+  4. Se o registro já existir com watermark preenchido, NÃO sobrescreve
+     (preserva progresso real de execuções anteriores do ETL).
+
+Fontes de design:
+  - Estrutura e logging: Matheus Carvalho
+  - UPSERT inteligente com preservação de progresso: Alessandra Bello
 
 Exit code: 0 = sucesso, 1 = falha.
 """
@@ -39,12 +45,20 @@ CREATE TABLE IF NOT EXISTS etl_watermark (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 """
 
-# INSERT só se o registro ainda não existir.
-# Usa INSERT IGNORE para ignorar silenciosamente duplicatas (PK).
-INSERT_IF_ABSENT_SQL = """
-INSERT IGNORE INTO etl_watermark
+# UPSERT inteligente (Alessandra):
+#   - Se o registro não existir: insere com MAX(orderDate) como watermark.
+#   - Se existir mas last_processed_order_date for NULL: atualiza com MAX(orderDate).
+#   - Se existir com watermark já preenchido: NÃO sobrescreve (preserva progresso real).
+UPSERT_SQL = """
+INSERT INTO etl_watermark
     (pipeline_name, last_processed_order_date, last_run_at, last_run_status)
-VALUES (%s, %s, NULL, 'NEVER_RUN')
+VALUES
+    (%(pipeline_name)s, %(max_date)s, NULL, 'NEVER_RUN')
+ON DUPLICATE KEY UPDATE
+    last_processed_order_date = CASE
+        WHEN last_processed_order_date IS NULL THEN VALUES(last_processed_order_date)
+        ELSE last_processed_order_date
+    END
 """
 
 
@@ -58,23 +72,20 @@ def main() -> int:
         log.info("Criando tabela etl_watermark (se não existir)...")
         cur.execute(CREATE_TABLE_SQL)
 
-        # 2. Verifica se o registro já existe
-        cur.execute(
-            "SELECT last_processed_order_date FROM etl_watermark WHERE pipeline_name = %s",
-            (PIPELINE_NAME,),
-        )
-        existing = cur.fetchone()
+        # 2. Obtém MAX(orderDate) como baseline
+        cur.execute("SELECT MAX(orderDate) FROM orders")
+        max_date = cur.fetchone()[0]
 
-        if existing is None:
-            # 3. Obtém MAX(orderDate) como baseline
-            cur.execute("SELECT MAX(orderDate) FROM orders")
-            max_date = cur.fetchone()[0]
+        if max_date is None:
+            log.error("Tabela 'orders' está vazia ou não existe. Verifique a carga do A1.")
+            return 1
 
-            log.info("Inserindo registro '%s' com watermark=%s...", PIPELINE_NAME, max_date)
-            cur.execute(INSERT_IF_ABSENT_SQL, (PIPELINE_NAME, max_date))
-            inserted = True
-        else:
-            inserted = False
+        log.info("MAX(orders.orderDate) encontrado: %s", max_date)
+
+        # 3. UPSERT do registro
+        log.info("Inserindo/validando registro '%s'...", PIPELINE_NAME)
+        cur.execute(UPSERT_SQL, {"pipeline_name": PIPELINE_NAME, "max_date": max_date})
+        affected = cur.rowcount
 
         conn.commit()
 
@@ -88,15 +99,17 @@ def main() -> int:
         cur.close()
 
         if row is None:
-            log.error("Registro '%s' não encontrado após insert — algo deu errado.", PIPELINE_NAME)
+            log.error("Registro '%s' não encontrado após upsert — algo deu errado.", PIPELINE_NAME)
             return 1
 
         pipeline, wm_date, run_at, status = row
 
-        if inserted:
+        if affected == 1:
             log.info("✓ Registro CRIADO:")
+        elif affected == 2:
+            log.info("✓ Registro atualizado (watermark estava NULL):")
         else:
-            log.info("✓ Registro já existia (idempotente):")
+            log.info("✓ Registro já existia com watermark preenchido (sem alteração):")
 
         log.info("  pipeline_name             = %s", pipeline)
         log.info("  last_processed_order_date  = %s", wm_date)
